@@ -1,135 +1,191 @@
+
 const express = require("express");
 
 const app = express();
 app.use(express.json({ limit: "10kb" }));
 
-const REGION = (process.env.FF_REGION || "BD").toUpperCase();
+const REGION = "BD";
+const MIN_LIKES = 20;
+const MAX_LIKES = 100;
 
-// Set these in Render Environment only after verifying a provider's
-// official documentation and response format.
-const PLAYER_API_URL = process.env.PLAYER_API_URL || "";
-const PLAYER_API_KEY = process.env.PLAYER_API_KEY || "";
+// Render Environment Variables
+const API_KEYS = (process.env.X2D_API_KEYS || "")
+  .split(",")
+  .map(key => key.trim())
+  .filter(Boolean);
+
 const LIKE_API_URL = process.env.LIKE_API_URL || "";
-const LIKE_API_KEY = process.env.LIKE_API_KEY || "";
+const LIKE_PROVIDER_KEY = process.env.LIKE_PROVIDER_KEY || "";
 
-function validUid(value) {
-  return /^\d{6,20}$/.test(String(value ?? "").trim());
+// Temporary in-memory limit.
+// A server restart clears this data.
+const dailyRequests = new Map();
+
+function validUid(uid) {
+  return /^\d{6,20}$/.test(String(uid ?? "").trim());
 }
 
-async function providerRequest(url, apiKey, payload) {
-  const headers = { "Content-Type": "application/json" };
-  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+function authenticate(req, res, next) {
+  const key = req.get("x-api-key");
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(10000)
-  });
-
-  const text = await response.text();
-  let data;
-  try { data = JSON.parse(text); }
-  catch { data = { message: "Provider returned a non-JSON response" }; }
-
-  if (!response.ok) {
-    const error = new Error(`Provider returned HTTP ${response.status}`);
-    error.status = response.status;
-    throw error;
+  if (!API_KEYS.length) {
+    return res.status(503).json({
+      success: false,
+      message: "X2D API keys are not configured"
+    });
   }
-  return data;
+
+  if (!key || !API_KEYS.includes(key)) {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid or missing API key"
+    });
+  }
+
+  next();
+}
+
+function todayKey(uid) {
+  const date = new Date().toISOString().slice(0, 10);
+  return `${date}:${uid}`;
 }
 
 app.get("/", (_req, res) => {
   res.json({
     success: true,
-    service: "X2D E-SPORTS API",
+    service: "X2D E-SPORTS Custom Like API",
     status: "online",
     region: REGION,
-    endpoints: ["POST /player", "POST /like"]
+    minLikes: MIN_LIKES,
+    maxLikes: MAX_LIKES,
+    dailyLimitPerUID: 1,
+    endpoints: ["POST /like", "POST /player"]
   });
 });
 
-app.post("/player", async (req, res) => {
+app.post("/like", authenticate, async (req, res) => {
   const uid = String(req.body?.uid ?? "").trim();
-  const region = String(req.body?.region || REGION).trim().toUpperCase();
+  const likes = Number(req.body?.likes);
 
   if (!validUid(uid)) {
     return res.status(400).json({
       success: false,
-      message: "Valid Free Fire UID required (6–20 digits)"
-    });
-  }
-  if (!/^[A-Z]{2,5}$/.test(region)) {
-    return res.status(400).json({ success: false, message: "Invalid region" });
-  }
-  if (!PLAYER_API_URL) {
-    return res.status(503).json({
-      success: false,
-      uid,
-      region,
-      message: "Player data provider is not configured yet"
+      message: "A valid Free Fire UID is required"
     });
   }
 
-  try {
-    const data = await providerRequest(PLAYER_API_URL, PLAYER_API_KEY, { uid, region });
-    return res.json({ success: true, uid, region, player: data });
-  } catch (_error) {
-    return res.status(502).json({
-      success: false,
-      uid,
-      region,
-      message: "Player data provider request failed"
-    });
-  }
-});
-
-app.post("/like", async (req, res) => {
-  const uid = String(req.body?.uid ?? "").trim();
-  const region = String(req.body?.region || REGION).trim().toUpperCase();
-
-  if (!validUid(uid)) {
+  if (
+    !Number.isInteger(likes) ||
+    likes < MIN_LIKES ||
+    likes > MAX_LIKES
+  ) {
     return res.status(400).json({
       success: false,
-      message: "Valid Free Fire UID required (6–20 digits)"
+      message: `Likes must be between ${MIN_LIKES} and ${MAX_LIKES}`
     });
   }
-  if (!/^[A-Z]{2,5}$/.test(region)) {
-    return res.status(400).json({ success: false, message: "Invalid region" });
-  }
+
   if (!LIKE_API_URL) {
     return res.status(503).json({
       success: false,
       uid,
-      region,
+      region: REGION,
+      requestedLikes: likes,
       likesSent: 0,
       message: "Like provider is not configured; no likes were sent"
     });
   }
 
+  const key = todayKey(uid);
+
+  if (dailyRequests.has(key)) {
+    return res.status(429).json({
+      success: false,
+      uid,
+      message: "This UID has already made a request today"
+    });
+  }
+
   try {
-    const data = await providerRequest(LIKE_API_URL, LIKE_API_KEY, { uid, region });
-    return res.json({ success: true, uid, region, result: data });
+    const headers = {
+      "Content-Type": "application/json"
+    };
+
+    if (LIKE_PROVIDER_KEY) {
+      headers.Authorization = `Bearer ${LIKE_PROVIDER_KEY}`;
+    }
+
+    const response = await fetch(LIKE_API_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        uid,
+        region: REGION,
+        likes
+      }),
+      signal: AbortSignal.timeout(10000)
+    });
+
+    if (!response.ok) {
+      return res.status(502).json({
+        success: false,
+        uid,
+        likesSent: 0,
+        message: "Like provider rejected the request"
+      });
+    }
+
+    const result = await response.json();
+
+    // Do not claim success unless the provider explicitly confirms it.
+    if (result.success !== true) {
+      return res.status(502).json({
+        success: false,
+        uid,
+        likesSent: 0,
+        message: "Provider did not confirm successful delivery"
+      });
+    }
+
+    // Reserve the UID only after confirmed provider success.
+    dailyRequests.set(key, Date.now());
+
+    return res.json({
+      success: true,
+      uid,
+      region: REGION,
+      requestedLikes: likes,
+      providerResult: result,
+      message: "Provider confirmed the request"
+    });
   } catch (_error) {
     return res.status(502).json({
       success: false,
       uid,
-      region,
       likesSent: 0,
-      message: "Like provider request failed"
+      message: "Could not connect to the like provider"
     });
   }
 });
 
-app.use((err, _req, res, _next) => {
-  if (err instanceof SyntaxError && "body" in err) {
-    return res.status(400).json({ success: false, message: "Invalid JSON body" });
+app.post("/player", authenticate, async (req, res) => {
+  const uid = String(req.body?.uid ?? "").trim();
+
+  if (!validUid(uid)) {
+    return res.status(400).json({
+      success: false,
+      message: "A valid Free Fire UID is required"
+    });
   }
-  return res.status(500).json({ success: false, message: "Internal server error" });
+
+  return res.status(503).json({
+    success: false,
+    uid,
+    region: REGION,
+    message: "Player data provider is not configured"
+  });
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, "0.0.0.0", () => {
-  console.log(`X2D E-SPORTS API started on port ${port}; region ${REGION}`);
+app.listen(process.env.PORT || 3000, "0.0.0.0", () => {
+  console.log("X2D E-SPORTS API started");
 });
